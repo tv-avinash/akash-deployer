@@ -33,22 +33,30 @@ const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL || "";
 const REDIS_TOK = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 const redis = (REDIS_URL && REDIS_TOK) ? new Redis({ url: REDIS_URL, token: REDIS_TOK }) : null;
 
-async function qLen() { return redis ? (await redis.llen(QUEUE_KEY)) : 0; }
+async function qLen() {
+  if (!redis) return 0;
+  try { return await redis.llen(QUEUE_KEY); } catch { return 0; }
+}
 async function enqueue(job) {
   if (!redis) throw new Error("queue_not_configured");
-  await redis.rpush(QUEUE_KEY, JSON.stringify(job));       // FIFO: push to tail
-  return await redis.llen(QUEUE_KEY);
+  await redis.rpush(QUEUE_KEY, JSON.stringify(job)); // FIFO tail
+  return await qLen();
 }
 async function dequeue() {
   if (!redis) return null;
-  const raw = await redis.lpop(QUEUE_KEY);                 // pop from head
+  const raw = await redis.lpop(QUEUE_KEY); // pop head
   if (!raw) return null;
-  try { return JSON.parse(raw); } catch { return null; }
+  try { return JSON.parse(raw); } catch { return { __raw: raw }; }
 }
+// ✅ NEW: fetch full list (0..-1) then slice locally
 async function peekAll(limit = 50) {
   if (!redis) return [];
-  const arr = await redis.lrange(QUEUE_KEY, 0, Math.max(0, limit - 1));
-  return arr.map(v => { try { return JSON.parse(v); } catch { return null; } }).filter(Boolean);
+  const arr = await redis.lrange(QUEUE_KEY, 0, -1); // full list
+  const top = arr.slice(0, Math.max(0, limit));
+  return top.map(v => {
+    if (typeof v === "object" && v !== null) return v; // some SDKs auto-parse
+    try { return JSON.parse(v); } catch { return { __raw: v }; }
+  });
 }
 async function clearQueue() {
   if (!redis) return;
@@ -224,13 +232,18 @@ app.get("/__info", async (req,res) => {
     busy_check_url: !!BUSY_CHECK,
     enable_queue: ENABLE_QUEUE,
     queue_len: len,
-    queue_store: redis ? "upstash" : "none"
+    queue_store: redis ? "upstash" : "none",
+    queue_key: QUEUE_KEY
   });
 });
 
 app.get("/admin/queue", async (req,res) => {
-  const items = await peekAll(50).catch(()=>[]);
-  res.json({ queue: items });
+  try {
+    const items = await peekAll(100);
+    res.json({ key: QUEUE_KEY, size: await qLen(), queue: items });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
 });
 
 app.post("/admin/queue/clear", async (req,res) => {
