@@ -10,13 +10,13 @@ app.use(express.json({ limit: "1mb" }));
 const AKASH_NODE   = process.env.AKASH_NODE   || "https://rpc.akashnet.net:443";
 const AKASH_CHAIN  = process.env.AKASH_CHAIN  || "akashnet-2";
 const FROM         = process.env.AKASH_FROM   || "tenant";
-const MNEMONIC     = process.env.AKASH_MNEMONIC;            // 24 words (secret)
-const KEYRING_BACK = process.env.KEYRING_BACKEND || "test"; // non-interactive
-const PROVIDER     = process.env.PROVIDER_ADDR;             // akash1...
+const MNEMONIC     = process.env.AKASH_MNEMONIC;
+const KEYRING_BACK = process.env.KEYRING_BACKEND || "test";
+const PROVIDER     = process.env.PROVIDER_ADDR;
 const MIN_DEPOSIT  = process.env.MIN_DEPOSIT || "5000000uakt";
-const BUSY_CHECK   = process.env.BUSY_CHECK_URL || "";      // optional
+const BUSY_CHECK   = process.env.BUSY_CHECK_URL || "";
 
-// NEW: flags for safe testing
+// NEW flags for safe testing
 const DRY_RUN = /^(1|true|yes)$/i.test(process.env.DRY_RUN || "");
 const DISABLE_BUSY_CHECK = /^(1|true|yes)$/i.test(process.env.DISABLE_BUSY_CHECK || "");
 
@@ -61,25 +61,30 @@ function sdlFor(product) {
 
 const wait = (ms)=>new Promise(r=>setTimeout(r,ms));
 
+// small info endpoint to verify flags are active
+app.get("/__info", (req,res) => {
+  res.json({ dry_run: DRY_RUN, disable_busy_check: DISABLE_BUSY_CHECK, busy_check_url: BUSY_CHECK ? true : false });
+});
+
 // --- main endpoint ---
 app.post("/", async (req, res) => {
   const idem = req.headers["idempotency-key"];
   const { product, minutes = 60, customer, payment } = req.body || {};
 
-  // validate first (so tests work even if busy)
+  // Validate first (so tests work even if busy)
   const ALLOWED = new Set(["whisper", "sd", "llama"]);
   if (!ALLOWED.has(product)) {
     return res.status(400).json({ error: "invalid_product" });
   }
 
-  // DRY RUN: short-circuit here (no lease, no spend)
+  // DRY RUN: short-circuit here (no Akash calls, no spend)
   if (DRY_RUN) {
     const uri = `https://demo.indianode.com/job/${product}-${Date.now() % 1e6}`;
     console.log("dry_run_accept", { idem, product, minutes, customer, payment, uri });
     return res.json({ status: "ok", uri, idempotency_key: idem, dry_run: true });
   }
 
-  // respect busy check unless disabled
+  // Respect busy check unless disabled
   if (!(await gpuAvailable())) {
     return res.status(409).json({ status: "busy", message: "GPU busy" });
   }
@@ -92,7 +97,6 @@ app.post("/", async (req, res) => {
     const sdlPath = `/tmp/${dseq}.yaml`;
     await fs.writeFile(sdlPath, sdl);
 
-    // 1) create deployment
     await sh("akash", [
       "tx","deployment","create", sdlPath,
       "--from", FROM, "--keyring-backend", KEYRING_BACK,
@@ -100,7 +104,6 @@ app.post("/", async (req, res) => {
       "--deposit", MIN_DEPOSIT, "--yes"
     ]);
 
-    // 2) wait for lease from our provider
     let lease = null;
     for (let i=0;i<30;i++){
       const out = await sh("akash", [
@@ -119,7 +122,6 @@ app.post("/", async (req, res) => {
 
     const { gseq, oseq, provider } = lease;
 
-    // 3) send manifest
     await sh("akash", [
       "provider","send-manifest", sdlPath,
       "--node", AKASH_NODE,
@@ -127,7 +129,6 @@ app.post("/", async (req, res) => {
       "--owner", owner, "--provider", provider
     ]);
 
-    // 4) poll for URI
     let uri = "";
     for (let i=0;i<45;i++){
       const out = await sh("akash", [
@@ -145,7 +146,6 @@ app.post("/", async (req, res) => {
     }
     if (!uri) console.warn("no_uri_yet");
 
-    // 5) auto-close later
     setTimeout(async () => {
       try {
         await sh("akash", [
