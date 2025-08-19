@@ -106,27 +106,37 @@ function sdlFor(product) {
 
 const wait = (ms)=>new Promise(r=>setTimeout(r,ms));
 
-// ---- Notify helpers ----
+// ---- Notify helpers (with robust logging) ----
 async function notifyLive({ email, uri, product, minutes, dry_run }) {
   if (!NOTIFY_URL || !email || !uri) return;
   try {
-    await fetch(NOTIFY_URL, {
+    const resp = await fetch(NOTIFY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Notify-Token": NOTIFY_TOKEN || "" },
       body: JSON.stringify({ email, uri, product, minutes, dry_run: !!dry_run }),
     });
-  } catch {}
+    const txt = await resp.text();
+    if (!resp.ok) console.error("notifyLive_fail", resp.status, txt);
+    else console.log("notifyLive_ok", { email, product, minutes, dry_run: !!dry_run });
+  } catch (e) {
+    console.error("notifyLive_err", e?.message || String(e));
+  }
 }
 
 async function notifyQueued({ email, product, minutes, position }) {
   if (!NOTIFY_URL || !email) return;
   try {
-    await fetch(NOTIFY_URL, {
+    const resp = await fetch(NOTIFY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Notify-Token": NOTIFY_TOKEN || "" },
       body: JSON.stringify({ email, product, minutes, queued: true, position }),
     });
-  } catch {}
+    const txt = await resp.text();
+    if (!resp.ok) console.error("notifyQueued_fail", resp.status, txt);
+    else console.log("notifyQueued_ok", { email, product, minutes, position });
+  } catch (e) {
+    console.error("notifyQueued_err", e?.message || String(e));
+  }
 }
 
 // ---- Core run logic (used by API and queue worker) ----
@@ -232,14 +242,16 @@ app.get("/__info", async (req,res) => {
     enable_queue: ENABLE_QUEUE,
     queue_len: len,
     queue_store: redis ? "upstash" : "none",
-    queue_key: QUEUE_KEY
+    queue_key: QUEUE_KEY,
+    notify_url_configured: !!NOTIFY_URL,
+    notify_token_set: !!NOTIFY_TOKEN
   });
 });
 
 app.get("/admin/queue", async (req,res) => {
   try {
-    const items = await peekAll(100);
-    res.json({ key: QUEUE_KEY, size: await qLen(), queue: items });
+    const [items, size] = await Promise.all([peekAll(100), qLen()]);
+    res.json({ key: QUEUE_KEY, size, queue: items });
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
@@ -256,6 +268,20 @@ app.post("/admin/queue/clear", async (req,res) => {
 app.get("/debug/busy", async (req,res) => {
   const r = await gpuAvailableRaw();
   res.json(r);
+});
+
+// Debug: force-send a queued email (no Akash calls)
+app.post("/debug/send-queued", async (req, res) => {
+  const { email = "tvavinash@gmail.com", product = "sd", minutes = 60, position = 1 } = req.body || {};
+  await notifyQueued({ email, product, minutes, position });
+  res.json({ ok: true });
+});
+
+// Debug: force-send a live email (no Akash calls)
+app.post("/debug/send-live", async (req, res) => {
+  const { email = "tvavinash@gmail.com", product = "sd", minutes = 60, uri = "https://demo.indianode.com/job/test", dry_run = false } = req.body || {};
+  await notifyLive({ email, uri, product, minutes, dry_run });
+  res.json({ ok: true });
 });
 
 // ---- API: submit job ----
@@ -275,10 +301,7 @@ app.post("/", async (req, res) => {
       try {
         const position = await enqueue({ product, minutes, customer, payment, at: Date.now(), idem });
         console.log("queued_job", { position, product, minutes, email: customer?.email });
-        // NEW: send queued-email now
-        if (customer?.email) {
-          await notifyQueued({ email: customer.email, product, minutes, position });
-        }
+        if (customer?.email) await notifyQueued({ email: customer.email, product, minutes, position });
         return res.status(200).json({ status: "queued", position });
       } catch (e) {
         console.error("queue_error", e.message || e);
