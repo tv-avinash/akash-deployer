@@ -1,4 +1,4 @@
-// server.js — Akash deployer with durable Upstash Redis queue + notify
+// server.js — Akash deployer with durable Upstash Redis queue + safe worker + debug
 import express from "express";
 import { execFile } from "child_process";
 import fs from "fs/promises";
@@ -79,16 +79,22 @@ async function ensureAkashKey() {
 }
 
 // Fail-closed: if check errors, treat as busy so queue is preserved
-async function gpuAvailable() {
-  if (DISABLE_BUSY_CHECK || !BUSY_CHECK) return true;
+async function gpuAvailableRaw() {
+  if (DISABLE_BUSY_CHECK || !BUSY_CHECK) return { ok: true, available: true, raw: { note: "busy_check_disabled" } };
   try {
     const r = await fetch(BUSY_CHECK, { cache: "no-store" });
-    const j = await r.json();
-    return j?.status === "available";
+    const text = await r.text();
+    let json = {};
+    try { json = JSON.parse(text); } catch {}
+    const available = json?.status === "available";
+    return { ok: true, available, raw: json, text };
   } catch (e) {
-    console.error("BUSY_CHECK_ERROR", e?.message || e);
-    return false;
+    return { ok: false, available: false, error: e?.message || String(e) };
   }
+}
+async function gpuAvailable() {
+  const res = await gpuAvailableRaw();
+  return res.available;
 }
 
 function sdlFor(product) {
@@ -207,7 +213,7 @@ async function runJob({ product, minutes = 60, customer = {}, payment = {} }) {
   return { status: "ok", uri, dseq, gseq, oseq, provider };
 }
 
-// ---- Info/admin endpoints ----
+// ---- Info/admin/debug endpoints ----
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 
 app.get("/__info", async (req,res) => {
@@ -232,6 +238,12 @@ app.post("/admin/queue/clear", async (req,res) => {
   if (!ADMIN_TOKEN || t !== ADMIN_TOKEN) return res.status(401).json({ error: "unauthorized" });
   await clearQueue();
   res.json({ ok: true });
+});
+
+// Debug: see what busy-check returns
+app.get("/debug/busy", async (req,res) => {
+  const r = await gpuAvailableRaw();
+  res.json(r);
 });
 
 // ---- API: submit job ----
@@ -270,13 +282,21 @@ app.post("/", async (req, res) => {
   }
 });
 
-// ---- Queue worker ----
+// ---- Queue worker (safe) ----
 let inFlight = false;
+let lastAvailOk = false; // require 2 consecutive "available" reads
+
 async function processQueueOnce() {
   if (!ENABLE_QUEUE) return;
   if (inFlight) return;
-  if (!(await gpuAvailable())) return;
 
+  const busy = !(await gpuAvailable());
+  console.log("worker_tick", { busy, lastAvailOk });
+
+  if (busy) { lastAvailOk = false; return; } // still busy
+  if (!lastAvailOk) { lastAvailOk = true; return; } // first OK, confirm on next tick
+
+  // Now 2nd consecutive available → process one item
   const next = await dequeue();
   if (!next) return;
 
