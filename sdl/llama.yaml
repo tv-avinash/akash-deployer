@@ -2,7 +2,7 @@ version: "2.0"
 
 services:
   app:
-    image: ghcr.io/your-org/llama-serving:latest    # TODO: replace
+    image: ghcr.io/your-org/llama-serving:latest
     expose:
       - port: 8000
         as: 80
@@ -13,15 +13,18 @@ profiles:
   compute:
     app:
       resources:
-        cpu:    { units: 4 }
+        cpu: { units: 4 }
         memory: { size: 24Gi }
-        storage:{ size: 20Gi }
+        storage: { size: 20Gi }
         gpu:
           units: 1
           attributes:
             vendor: "nvidia"
   placement:
     onlyyou:
+      signedBy:
+        anyOf:
+          - "PROVIDER_ADDR_REPLACE_ME"
       pricing:
         app:
           denom: uakt
