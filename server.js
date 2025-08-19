@@ -1,9 +1,9 @@
-// sender.js — Akash deployer with DRY_RUN, Queue, and Notify
+// server.js — Akash deployer with durable Upstash Redis queue + notify
 import express from "express";
 import { execFile } from "child_process";
 import fs from "fs/promises";
-import fsSync from "fs";
 import path from "path";
+import { Redis } from "@upstash/redis";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -23,10 +23,37 @@ const DRY_RUN            = /^(1|true|yes)$/i.test(process.env.DRY_RUN || "");
 const DISABLE_BUSY_CHECK = /^(1|true|yes)$/i.test(process.env.DISABLE_BUSY_CHECK || "");
 const ENABLE_QUEUE       = /^(1|true|yes)$/i.test(process.env.ENABLE_QUEUE || "");
 
-// Queue/notify
-const QUEUE_FILE   = process.env.QUEUE_FILE || "/tmp/queue.json";
+// Notify (calls your Next.js /api/notify)
 const NOTIFY_URL   = process.env.NOTIFY_URL || "";
 const NOTIFY_TOKEN = process.env.NOTIFY_TOKEN || "";
+
+// ---- Durable queue via Upstash Redis ----
+const QUEUE_KEY = process.env.QUEUE_KEY || "indianode:queue";
+const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL || "";
+const REDIS_TOK = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+const redis = (REDIS_URL && REDIS_TOK) ? new Redis({ url: REDIS_URL, token: REDIS_TOK }) : null;
+
+async function qLen() { return redis ? (await redis.llen(QUEUE_KEY)) : 0; }
+async function enqueue(job) {
+  if (!redis) throw new Error("queue_not_configured");
+  await redis.rpush(QUEUE_KEY, JSON.stringify(job));       // FIFO: push to tail
+  return await redis.llen(QUEUE_KEY);
+}
+async function dequeue() {
+  if (!redis) return null;
+  const raw = await redis.lpop(QUEUE_KEY);                 // pop from head
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+async function peekAll(limit = 50) {
+  if (!redis) return [];
+  const arr = await redis.lrange(QUEUE_KEY, 0, Math.max(0, limit - 1));
+  return arr.map(v => { try { return JSON.parse(v); } catch { return null; } }).filter(Boolean);
+}
+async function clearQueue() {
+  if (!redis) return;
+  await redis.del(QUEUE_KEY);
+}
 
 // ------------------------------------------------------------
 
@@ -51,13 +78,17 @@ async function ensureAkashKey() {
   }
 }
 
+// Fail-closed: if check errors, treat as busy so queue is preserved
 async function gpuAvailable() {
   if (DISABLE_BUSY_CHECK || !BUSY_CHECK) return true;
   try {
     const r = await fetch(BUSY_CHECK, { cache: "no-store" });
     const j = await r.json();
     return j?.status === "available";
-  } catch { return true; } // fail-open
+  } catch (e) {
+    console.error("BUSY_CHECK_ERROR", e?.message || e);
+    return false;
+  }
 }
 
 function sdlFor(product) {
@@ -70,21 +101,6 @@ function sdlFor(product) {
 }
 
 const wait = (ms)=>new Promise(r=>setTimeout(r,ms));
-
-// ---- Queue helpers ----
-function loadQueue() {
-  try { return JSON.parse(fsSync.readFileSync(QUEUE_FILE, "utf8") || "[]"); }
-  catch { return []; }
-}
-function saveQueue(q) {
-  try { fsSync.writeFileSync(QUEUE_FILE, JSON.stringify(q)); } catch {}
-}
-function enqueue(job) {
-  const q = loadQueue(); q.push(job); saveQueue(q); return q.length;
-}
-function dequeue() {
-  const q = loadQueue(); const job = q.shift(); saveQueue(q); return job;
-}
 
 async function notifyLive({ email, uri, product, minutes, dry_run }) {
   if (!NOTIFY_URL || !email || !uri) return;
@@ -192,46 +208,59 @@ async function runJob({ product, minutes = 60, customer = {}, payment = {} }) {
 }
 
 // ---- Info/admin endpoints ----
-app.get("/__info", (req,res) => {
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+
+app.get("/__info", async (req,res) => {
+  const len = await qLen().catch(()=>0);
   res.json({
     dry_run: DRY_RUN,
     disable_busy_check: DISABLE_BUSY_CHECK,
     busy_check_url: !!BUSY_CHECK,
     enable_queue: ENABLE_QUEUE,
-    queue_len: loadQueue().length
+    queue_len: len,
+    queue_store: redis ? "upstash" : "none"
   });
 });
 
-app.get("/admin/queue", (req,res) => {
-  res.json({ queue: loadQueue() });
+app.get("/admin/queue", async (req,res) => {
+  const items = await peekAll(50).catch(()=>[]);
+  res.json({ queue: items });
+});
+
+app.post("/admin/queue/clear", async (req,res) => {
+  const t = req.headers["x-admin-token"];
+  if (!ADMIN_TOKEN || t !== ADMIN_TOKEN) return res.status(401).json({ error: "unauthorized" });
+  await clearQueue();
+  res.json({ ok: true });
 });
 
 // ---- API: submit job ----
 app.post("/", async (req, res) => {
   const idem = req.headers["idempotency-key"];
-  const { product, minutes = 60, customer, payment } = req.body || {};
+  const { product, minutes = 60, customer = {}, payment = {} } = req.body || {};
 
   const ALLOWED = new Set(["whisper", "sd", "llama"]);
   if (!ALLOWED.has(product)) {
     return res.status(400).json({ error: "invalid_product" });
   }
 
-  // DRY RUN: short-circuit (no spend)
-  if (DRY_RUN) {
-    const out = await runJob({ product, minutes, customer, payment });
-    return res.json({ ...out, idempotency_key: idem });
-  }
-
-  // Respect busy check unless disabled; queue if enabled
-  if (!(await gpuAvailable())) {
+  // If busy → queue (when enabled)
+  const isBusy = !(await gpuAvailable());
+  if (isBusy) {
     if (ENABLE_QUEUE) {
-      const position = enqueue({ product, minutes, customer, payment, at: Date.now() });
-      console.log("queued_job", { position, product, minutes, email: customer?.email });
-      return res.status(200).json({ status: "queued", position });
+      try {
+        const position = await enqueue({ product, minutes, customer, payment, at: Date.now(), idem });
+        console.log("queued_job", { position, product, minutes, email: customer?.email });
+        return res.status(200).json({ status: "queued", position });
+      } catch (e) {
+        console.error("queue_error", e.message || e);
+        return res.status(503).json({ status: "queue_unavailable", error: String(e.message || e) });
+      }
     }
     return res.status(409).json({ status: "busy", message: "GPU busy" });
   }
 
+  // Available → run now
   try {
     const out = await runJob({ product, minutes, customer, payment });
     return res.json({ ...out, idempotency_key: idem });
@@ -248,7 +277,7 @@ async function processQueueOnce() {
   if (inFlight) return;
   if (!(await gpuAvailable())) return;
 
-  const next = dequeue();
+  const next = await dequeue();
   if (!next) return;
 
   inFlight = true;

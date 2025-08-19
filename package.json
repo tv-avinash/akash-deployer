@@ -3,7 +3,10 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "@upstash/redis": "^1.35.3",
     "express": "^4.19.2"
   },
-  "scripts": { "start": "node server.js" }
+  "scripts": {
+    "start": "node server.js"
+  }
 }
