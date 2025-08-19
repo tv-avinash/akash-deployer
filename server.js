@@ -1,4 +1,4 @@
-// server.js — Akash deployer with durable Upstash Redis queue + safe worker + debug
+// server.js — Akash deployer with durable Upstash Redis queue + queued+live email + safe worker + debug
 import express from "express";
 import { execFile } from "child_process";
 import fs from "fs/promises";
@@ -44,24 +44,17 @@ async function enqueue(job) {
 }
 async function dequeue() {
   if (!redis) return null;
-  const raw = await redis.lpop(QUEUE_KEY); // pop head
+  const raw = await redis.lpop(QUEUE_KEY); // head
   if (!raw) return null;
   try { return JSON.parse(raw); } catch { return { __raw: raw }; }
 }
-// fetch full list (0..-1) then slice locally
 async function peekAll(limit = 50) {
   if (!redis) return [];
   const arr = await redis.lrange(QUEUE_KEY, 0, -1); // full list
   const top = arr.slice(0, Math.max(0, limit));
-  return top.map(v => {
-    if (typeof v === "object" && v !== null) return v; // some SDKs auto-parse
-    try { return JSON.parse(v); } catch { return { __raw: v }; }
-  });
+  return top.map(v => { try { return JSON.parse(v); } catch { return { __raw: v }; } });
 }
-async function clearQueue() {
-  if (!redis) return;
-  await redis.del(QUEUE_KEY);
-}
+async function clearQueue() { if (redis) await redis.del(QUEUE_KEY); }
 
 // ------------------------------------------------------------
 
@@ -100,10 +93,7 @@ async function gpuAvailableRaw() {
     return { ok: false, available: false, error: e?.message || String(e) };
   }
 }
-async function gpuAvailable() {
-  const res = await gpuAvailableRaw();
-  return res.available;
-}
+async function gpuAvailable() { const r = await gpuAvailableRaw(); return r.available; }
 
 function sdlFor(product) {
   const file = product === "whisper" ? "whisper.yaml"
@@ -116,37 +106,25 @@ function sdlFor(product) {
 
 const wait = (ms)=>new Promise(r=>setTimeout(r,ms));
 
+// ---- Notify helpers ----
 async function notifyLive({ email, uri, product, minutes, dry_run }) {
   if (!NOTIFY_URL || !email || !uri) return;
   try {
     await fetch(NOTIFY_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Notify-Token": NOTIFY_TOKEN || "",
-      },
+      headers: { "Content-Type": "application/json", "X-Notify-Token": NOTIFY_TOKEN || "" },
       body: JSON.stringify({ email, uri, product, minutes, dry_run: !!dry_run }),
     });
   } catch {}
 }
 
-// NEW: send "Queued" email right when we enqueue
 async function notifyQueued({ email, product, minutes, position }) {
   if (!NOTIFY_URL || !email) return;
   try {
     await fetch(NOTIFY_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Notify-Token": NOTIFY_TOKEN || "",
-      },
-      body: JSON.stringify({
-        email,
-        product,
-        minutes,
-        queued: true,
-        position: Number(position || 1),
-      }),
+      headers: { "Content-Type": "application/json", "X-Notify-Token": NOTIFY_TOKEN || "" },
+      body: JSON.stringify({ email, product, minutes, queued: true, position }),
     });
   } catch {}
 }
@@ -297,9 +275,9 @@ app.post("/", async (req, res) => {
       try {
         const position = await enqueue({ product, minutes, customer, payment, at: Date.now(), idem });
         console.log("queued_job", { position, product, minutes, email: customer?.email });
-        // fire-and-forget queued email
+        // NEW: send queued-email now
         if (customer?.email) {
-          notifyQueued({ email: customer.email, product, minutes, position }).catch(()=>{});
+          await notifyQueued({ email: customer.email, product, minutes, position });
         }
         return res.status(200).json({ status: "queued", position });
       } catch (e) {
@@ -331,10 +309,9 @@ async function processQueueOnce() {
   const busy = !(await gpuAvailable());
   console.log("worker_tick", { busy, lastAvailOk });
 
-  if (busy) { lastAvailOk = false; return; } // still busy
-  if (!lastAvailOk) { lastAvailOk = true; return; } // first OK, confirm on next tick
+  if (busy) { lastAvailOk = false; return; }
+  if (!lastAvailOk) { lastAvailOk = true; return; }
 
-  // Now 2nd consecutive available → process one item
   const next = await dequeue();
   if (!next) return;
 
@@ -349,9 +326,7 @@ async function processQueueOnce() {
     inFlight = false;
   }
 }
-if (ENABLE_QUEUE) {
-  setInterval(processQueueOnce, 10_000); // every 10s
-}
+if (ENABLE_QUEUE) setInterval(processQueueOnce, 10_000);
 
 const port = process.env.PORT || 8080;
 app.listen(port, () => console.log("deployer up on", port));
