@@ -1,0 +1,35 @@
+version: "2.0"
+
+services:
+  app:
+    image: ghcr.io/your-org/whisper-serving:latest   # TODO: replace with your curated image
+    expose:
+      - port: 9000
+        as: 80
+        to:
+          - global: true
+
+profiles:
+  compute:
+    app:
+      resources:
+        cpu:    { units: 2 }
+        memory: { size: 8Gi }
+        storage:{ size: 10Gi }
+        gpu:
+          units: 1
+          attributes:
+            vendor: "nvidia"
+  placement:
+    onlyyou:
+      # Keep pricing so your provider bids; adjust as needed
+      pricing:
+        app:
+          denom: uakt
+          amount: 1000
+
+deployment:
+  app:
+    onlyyou:
+      profile: app
+      count: 1

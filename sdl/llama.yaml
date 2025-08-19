@@ -1,0 +1,34 @@
+version: "2.0"
+
+services:
+  app:
+    image: ghcr.io/your-org/llama-serving:latest    # TODO: replace
+    expose:
+      - port: 8000
+        as: 80
+        to:
+          - global: true
+
+profiles:
+  compute:
+    app:
+      resources:
+        cpu:    { units: 4 }
+        memory: { size: 24Gi }
+        storage:{ size: 20Gi }
+        gpu:
+          units: 1
+          attributes:
+            vendor: "nvidia"
+  placement:
+    onlyyou:
+      pricing:
+        app:
+          denom: uakt
+          amount: 2000
+
+deployment:
+  app:
+    onlyyou:
+      profile: app
+      count: 1

@@ -1,0 +1,34 @@
+version: "2.0"
+
+services:
+  app:
+    image: ghcr.io/your-org/sd-webui:latest         # TODO: replace with your curated image
+    expose:
+      - port: 7860
+        as: 80
+        to:
+          - global: true
+
+profiles:
+  compute:
+    app:
+      resources:
+        cpu:    { units: 2 }
+        memory: { size: 16Gi }
+        storage:{ size: 20Gi }
+        gpu:
+          units: 1
+          attributes:
+            vendor: "nvidia"
+  placement:
+    onlyyou:
+      pricing:
+        app:
+          denom: uakt
+          amount: 1500
+
+deployment:
+  app:
+    onlyyou:
+      profile: app
+      count: 1
