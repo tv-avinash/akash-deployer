@@ -48,7 +48,7 @@ async function dequeue() {
   if (!raw) return null;
   try { return JSON.parse(raw); } catch { return { __raw: raw }; }
 }
-// ✅ NEW: fetch full list (0..-1) then slice locally
+// fetch full list (0..-1) then slice locally
 async function peekAll(limit = 50) {
   if (!redis) return [];
   const arr = await redis.lrange(QUEUE_KEY, 0, -1); // full list
@@ -126,6 +126,27 @@ async function notifyLive({ email, uri, product, minutes, dry_run }) {
         "X-Notify-Token": NOTIFY_TOKEN || "",
       },
       body: JSON.stringify({ email, uri, product, minutes, dry_run: !!dry_run }),
+    });
+  } catch {}
+}
+
+// NEW: send "Queued" email right when we enqueue
+async function notifyQueued({ email, product, minutes, position }) {
+  if (!NOTIFY_URL || !email) return;
+  try {
+    await fetch(NOTIFY_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Notify-Token": NOTIFY_TOKEN || "",
+      },
+      body: JSON.stringify({
+        email,
+        product,
+        minutes,
+        queued: true,
+        position: Number(position || 1),
+      }),
     });
   } catch {}
 }
@@ -276,6 +297,10 @@ app.post("/", async (req, res) => {
       try {
         const position = await enqueue({ product, minutes, customer, payment, at: Date.now(), idem });
         console.log("queued_job", { position, product, minutes, email: customer?.email });
+        // fire-and-forget queued email
+        if (customer?.email) {
+          notifyQueued({ email: customer.email, product, minutes, position }).catch(()=>{});
+        }
         return res.status(200).json({ status: "queued", position });
       } catch (e) {
         console.error("queue_error", e.message || e);
