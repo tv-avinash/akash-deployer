@@ -1,4 +1,4 @@
-// server.js — Akash deployer with durable Upstash Redis queue + queued+live email + safe worker + debug
+// server.js — Akash deployer with durable Upstash Redis queue + queued+live email + safe worker + debug + auth
 import express from "express";
 import { execFile } from "child_process";
 import fs from "fs/promises";
@@ -26,6 +26,9 @@ const ENABLE_QUEUE       = /^(1|true|yes)$/i.test(process.env.ENABLE_QUEUE || ""
 // Notify (calls your Next.js /api/notify)
 const NOTIFY_URL   = process.env.NOTIFY_URL || "";
 const NOTIFY_TOKEN = process.env.NOTIFY_TOKEN || "";
+
+// 🔐 Auth for POST "/"
+const API_TOKEN = process.env.DEPLOYER_TOKEN || "";
 
 // ---- Durable queue via Upstash Redis ----
 const QUEUE_KEY = process.env.QUEUE_KEY || "indianode:queue";
@@ -244,7 +247,8 @@ app.get("/__info", async (req,res) => {
     queue_store: redis ? "upstash" : "none",
     queue_key: QUEUE_KEY,
     notify_url_configured: !!NOTIFY_URL,
-    notify_token_set: !!NOTIFY_TOKEN
+    notify_token_set: !!NOTIFY_TOKEN,
+    auth_required: !!API_TOKEN
   });
 });
 
@@ -286,6 +290,15 @@ app.post("/debug/send-live", async (req, res) => {
 
 // ---- API: submit job ----
 app.post("/", async (req, res) => {
+  // 🔐 Require token for job submission
+  if (API_TOKEN) {
+    const t = req.headers["x-deployer-token"];
+    if (t !== API_TOKEN) {
+      console.warn("unauthorized_post", { ip: req.ip });
+      return res.status(401).json({ error: "unauthorized" });
+    }
+  }
+
   const idem = req.headers["idempotency-key"];
   const { product, minutes = 60, customer = {}, payment = {} } = req.body || {};
 
